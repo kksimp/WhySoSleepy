@@ -1,0 +1,6 @@
+# Normalize line endings, but always check Windows scripts out with CRLF:
+# cmd.exe can misparse LF-only batch files.
+* text=auto
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
