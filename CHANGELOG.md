@@ -1,5 +1,21 @@
 # Changelog
 
+## 3.2
+
+### Added
+
+- **Keep Awake (option 2):** keeps the PC, and optionally the display, awake for 1-1440 minutes or until you press Q. It changes no settings and needs no admin rights, so it also works on PCs where policy controls the sleep timeouts. It warns when policy stops apps from preventing sleep.
+- **Undo Changes menu (option 8):** WhySoSleepy now saves the active plan, timeouts and hibernation state before it first changes them, and **Restore saved settings** puts them back (including removing the Ultimate Performance plan it added). The menu also offers: switch to Balanced, turn hibernation back on, remove Ultimate Performance, and restore the Windows default plans.
+- The analysis now lists what is keeping the PC awake right now, from `powercfg /requests`, with readable names. For example: "Microsoft Teams (ms-teams.exe) is keeping the display on (Video Wake Lock)".
+- **Power Plans submenu (option 6):** a numbered plan list with the active plan highlighted, plus switching to any plan.
+
+### Changed
+
+- The main menu is reorganized, with submenus for Power Plans, Reports and Undo.
+- Ultimate Performance moved into the Power Plans submenu and is no longer part of "disable sleep". The old option 6 is now **Disable Sleep + Hibernation** (option 5).
+- Enabling Ultimate Performance now notes that it uses more power, and says when it is already active.
+- Admin detection works in Constrained Language Mode.
+
 ## 3.1
 
 ### Fixed

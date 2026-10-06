@@ -6,12 +6,16 @@
     WhySoSleepy is an interactive menu that helps figure out why a Windows PC
     goes to sleep and what is in control of that: the local power plan, Group
     Policy, Intune / MDM, or a management agent such as Configuration Manager or
-    Tanium. It can also change sleep and display timeouts, switch to the
-    Ultimate Performance power plan, and generate powercfg reports.
+    Tanium. It shows what is keeping the PC awake right now, can keep the PC
+    awake for a while without changing any settings, changes sleep and display
+    timeouts, manages power plans and generates powercfg reports.
 
-    Several diagnostics need Administrator rights. When started without them,
-    the script asks to relaunch itself elevated (UAC prompt). If that is
-    declined it keeps running with limited functionality.
+    Settings are saved before WhySoSleepy first changes them, so the Undo menu
+    can put them back.
+
+    Several options need Administrator rights. When started without them, the
+    script asks to relaunch itself elevated (UAC prompt). If that is declined
+    it keeps running with limited functionality.
 
 .PARAMETER NoElevate
     Do not ask to relaunch as Administrator. Options that need elevation will
@@ -32,16 +36,22 @@ param(
     [switch]$NoElevate
 )
 
-$ScriptVersion = '3.1'
+$ScriptVersion = '3.2'
 $AppTitle      = "WhySoSleepy v$ScriptVersion"
 $Rule          = '=' * 60
 $GuidPattern   = '[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}'
+
+$BalancedSchemeGuid = '381b4222-f694-41f0-9685-ff5bb260df2e'
 
 # Built-in (hidden) scheme that "Ultimate Performance" plans are copied from,
 # and the GUID WhySoSleepy gives its copy so it can find it again on any
 # Windows display language.
 $UltimateSchemeGuid = 'e9a42b02-d5df-448d-aa00-03f14749eb61'
 $UltimatePlanGuid   = 'e28c86af-35f3-4692-9b2d-b89202566d6f'
+
+# "Allow applications to prevent automatic sleep". When a policy sets it to 0,
+# Keep Awake (and any other app) cannot hold the PC awake.
+$AllowSystemRequiredGuid = 'a4b195f5-8225-47d8-8012-9d41369786e2'
 
 # Friendly names for power setting GUIDs that commonly show up in policies.
 $PowerSettingNames = @{
@@ -52,18 +62,50 @@ $PowerSettingNames = @{
     'abfc2519-3608-4c2a-94ea-171b0ed546ab' = 'Allow standby states S1-S3'
     '94ac6d29-73ce-41a6-809f-6363ba21b47e' = 'Hybrid sleep'
     'bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d' = 'Allow wake timers'
+    'a4b195f5-8225-47d8-8012-9d41369786e2' = 'Allow apps to prevent automatic sleep'
     '5ca83367-6e45-459f-a27b-476b1d01c936' = 'Lid close action'
     '7648efa3-dd9c-4e3e-b566-50f929386280' = 'Power button action'
     '96996bc0-ad50-47ec-923b-6f41874dd9eb' = 'Sleep button action'
     '0e796bdb-100d-47d6-a2d5-f7d2daa51f51' = 'Require password on wake'
 }
 
+# What each "powercfg /requests" category means for sleep. PERFBOOST is left
+# out because it does not affect sleep.
+$RequestEffects = @{
+    DISPLAY          = 'is keeping the display on'
+    SYSTEM           = 'is keeping the PC awake'
+    EXECUTION        = 'is keeping the PC awake'
+    AWAYMODE         = 'is keeping the PC in away mode'
+    ACTIVELOCKSCREEN = 'is keeping the lock screen on'
+}
+
+# Timeouts that WhySoSleepy changes, saved for Undo before the first change.
+$TimeoutSettings = @(
+    @{ Subgroup = 'SUB_SLEEP'; Setting = 'STANDBYIDLE' }
+    @{ Subgroup = 'SUB_SLEEP'; Setting = 'HIBERNATEIDLE' }
+    @{ Subgroup = 'SUB_VIDEO'; Setting = 'VIDEOIDLE' }
+)
+
+# Where Undo keeps the settings WhySoSleepy changed. Power settings apply to
+# the whole PC, so this lives in ProgramData rather than the user profile.
+$UndoPath = Join-Path $env:ProgramData 'WhySoSleepy\undo.json'
+
 #region Console helpers
 
 function Test-IsAdmin {
-    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if ($null -eq $script:IsAdminCache) {
+        try {
+            $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+            $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+            $script:IsAdminCache = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        }
+        catch {
+            # Constrained Language Mode blocks the types above. An elevated
+            # token carries the High Mandatory Level SID instead.
+            $script:IsAdminCache = [bool](whoami /groups 2>$null | Select-String -SimpleMatch 'S-1-16-12288')
+        }
+    }
+    return $script:IsAdminCache
 }
 
 function Write-Header {
@@ -84,7 +126,16 @@ function Show-Screen {
 
 function Wait-ForEnter {
     Write-Host ''
-    Read-Host 'Press Enter to return to menu' | Out-Null
+    Read-Host 'Press Enter to continue' | Out-Null
+}
+
+function Write-InvalidOption {
+    Write-Host 'Invalid option.' -ForegroundColor Red
+    Start-Sleep -Seconds 1
+}
+
+function Read-MenuChoice {
+    return "$(Read-Host 'Select option')".Trim()
 }
 
 function Confirm-Action {
@@ -92,6 +143,24 @@ function Confirm-Action {
 
     $answer = Read-Host "$Prompt [y/N]"
     return ($answer -match '^\s*y(es)?\s*$')
+}
+
+function Read-Number {
+    # Prompts for a whole number in a range. Returns $null for invalid input.
+    param(
+        [string]$Prompt,
+        [int]$Minimum,
+        [int]$Maximum
+    )
+
+    $answer = Read-Host $Prompt
+    $value  = 0
+    if ([int]::TryParse("$answer".Trim(), [ref]$value) -and $value -ge $Minimum -and $value -le $Maximum) {
+        return $value
+    }
+
+    Write-Host "Please enter a whole number from $Minimum to $Maximum." -ForegroundColor Red
+    return $null
 }
 
 function Test-Elevation {
@@ -107,7 +176,8 @@ function Test-Elevation {
 
 function Get-DesktopPath {
     # Honors OneDrive Known Folder Move and other Desktop redirection.
-    $desktop = [Environment]::GetFolderPath('Desktop')
+    $desktop = $null
+    try { $desktop = [Environment]::GetFolderPath('Desktop') } catch { }
     if (-not $desktop) { $desktop = Join-Path $env:USERPROFILE 'Desktop' }
     return $desktop
 }
@@ -128,6 +198,184 @@ function Open-Report {
     }
     else {
         Invoke-Item -LiteralPath $Path
+    }
+}
+
+function Format-Duration {
+    param([TimeSpan]$Duration)
+
+    '{0:00}:{1:mm\:ss}' -f ($Duration.Days * 24 + $Duration.Hours), $Duration
+}
+
+#endregion
+
+#region Power plan helpers
+
+function Get-PowerPlan {
+    # Parses "powercfg /list": "Power Scheme GUID: <guid>  (<name>) *".
+    foreach ($line in @(powercfg /list 2>$null)) {
+        if ($line -match "($GuidPattern)\s+\((.+)\)\s*(\*)?\s*$") {
+            [pscustomobject]@{
+                Guid   = $Matches[1]
+                Name   = $Matches[2]
+                Active = [bool]$Matches[3]
+            }
+        }
+    }
+}
+
+function Get-PlanName {
+    param(
+        [string]$Guid,
+        [object[]]$Plans
+    )
+
+    $plan = $Plans | Where-Object { $_.Guid -eq $Guid } | Select-Object -First 1
+    if ($plan) { return $plan.Name }
+    return "$Guid (no longer exists)"
+}
+
+function Get-ActiveSchemeGuid {
+    $output = "$(powercfg /getactivescheme 2>$null)"
+    if ($output -match $GuidPattern) { return $Matches[0] }
+    return $null
+}
+
+function Get-PowerSettingValue {
+    # Returns the plugged-in (AC) and battery (DC) values of a setting. They are
+    # the last two hex numbers in "powercfg /query" output, which avoids relying
+    # on the labels (those are translated on non-English Windows).
+    param(
+        [string]$Scheme,
+        [string]$Subgroup,
+        [string]$Setting
+    )
+
+    $output = @(powercfg /query $Scheme $Subgroup $Setting 2>$null)
+    if ($LASTEXITCODE -ne 0) { return $null }
+
+    $hex = @($output | Select-String -Pattern '0x[0-9a-fA-F]+' -AllMatches |
+        ForEach-Object { $_.Matches } | ForEach-Object { $_.Value })
+    if ($hex.Count -lt 2) { return $null }
+
+    return @([long]$hex[-2], [long]$hex[-1])
+}
+
+function Test-HibernateEnabled {
+    # $true / $false, or $null when it cannot be determined.
+    $key = Get-Item -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -ErrorAction SilentlyContinue
+    if (-not $key) { return $null }
+
+    $value = $key.GetValue('HibernateEnabled')
+    if ($null -eq $value) { return $null }
+    return ($value -eq 1)
+}
+
+#endregion
+
+#region Undo state
+
+function Get-UndoState {
+    $undo = @{
+        Saved            = $null
+        ActiveScheme     = $null
+        HibernateEnabled = $null
+        CreatedPlan      = $null
+        Timeouts         = @()
+    }
+
+    if (Test-Path -LiteralPath $UndoPath) {
+        try {
+            $data = Get-Content -LiteralPath $UndoPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            foreach ($name in @($undo.Keys)) {
+                if ($null -ne $data.$name) { $undo[$name] = $data.$name }
+            }
+        }
+        catch {
+            Write-Host "Ignoring unreadable undo file ${UndoPath}: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    $undo.Timeouts = @($undo.Timeouts | Where-Object { $_ })
+    return $undo
+}
+
+function Save-UndoState {
+    # Writes the undo file, or deletes it once there is nothing left to undo.
+    param([hashtable]$Undo)
+
+    $empty = -not $Undo.ActiveScheme -and $null -eq $Undo.HibernateEnabled -and
+             -not $Undo.CreatedPlan -and $Undo.Timeouts.Count -eq 0
+
+    try {
+        if ($empty) {
+            if (Test-Path -LiteralPath $UndoPath) { Remove-Item -LiteralPath $UndoPath -ErrorAction Stop }
+            return $true
+        }
+
+        $folder = Split-Path -Path $UndoPath -Parent
+        if (-not (Test-Path -LiteralPath $folder)) {
+            New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop | Out-Null
+        }
+        $Undo | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $UndoPath -Encoding UTF8 -ErrorAction Stop
+        return $true
+    }
+    catch {
+        Write-Host "Could not update the undo file: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+function Update-UndoState {
+    # Records what a change is about to overwrite. Each item is saved only the
+    # first time, so Undo returns to the state before WhySoSleepy's first change.
+    param(
+        [switch]$ActiveScheme,
+        [switch]$Timeouts,
+        [switch]$Hibernation,
+        [string]$CreatedPlan
+    )
+
+    $undo    = Get-UndoState
+    $changed = $false
+
+    if ($ActiveScheme -and -not $undo.ActiveScheme) {
+        $undo.ActiveScheme = Get-ActiveSchemeGuid
+        $changed = [bool]$undo.ActiveScheme
+    }
+
+    if ($Hibernation -and $null -eq $undo.HibernateEnabled) {
+        $undo.HibernateEnabled = Test-HibernateEnabled
+        if ($null -ne $undo.HibernateEnabled) { $changed = $true }
+    }
+
+    if ($CreatedPlan -and -not $undo.CreatedPlan) {
+        $undo.CreatedPlan = $CreatedPlan
+        $changed = $true
+    }
+
+    if ($Timeouts) {
+        $scheme = Get-ActiveSchemeGuid
+        if ($scheme -and -not ($undo.Timeouts | Where-Object { $_.Scheme -eq $scheme })) {
+            foreach ($timeout in $TimeoutSettings) {
+                $values = Get-PowerSettingValue -Scheme $scheme -Subgroup $timeout.Subgroup -Setting $timeout.Setting
+                if (@($values).Count -eq 2) {
+                    $undo.Timeouts += [pscustomobject]@{
+                        Scheme   = $scheme
+                        Subgroup = $timeout.Subgroup
+                        Setting  = $timeout.Setting
+                        AC       = $values[0]
+                        DC       = $values[1]
+                    }
+                    $changed = $true
+                }
+            }
+        }
+    }
+
+    if ($changed) {
+        if (-not $undo.Saved) { $undo.Saved = Get-Date -Format 'yyyy-MM-dd HH:mm' }
+        $null = Save-UndoState -Undo $undo
     }
 }
 
@@ -182,6 +430,7 @@ function Get-PolicyPowerSetting {
                     Setting   = $name
                     PluggedIn = $ac
                     OnBattery = $dc
+                    Guid      = $guid
                 }
             }
         }
@@ -234,6 +483,74 @@ function Get-ManagementAgent {
     }
 }
 
+function Get-RequestSourceName {
+    # Turns a power request source into a readable name, for example
+    # "\Device\HarddiskVolume3\...\ms-teams.exe" -> "Microsoft Teams (ms-teams.exe)".
+    param(
+        [string]$Type,
+        [string]$Source
+    )
+
+    if ($Type -eq 'SERVICE' -and $Source -match '\(([^()]+)\)$') {
+        $serviceName = $Matches[1]
+        $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($service) { return "$($service.DisplayName) service" }
+        return "$serviceName service"
+    }
+
+    if ($Type -eq 'PROCESS' -or $Source -match '^\\Device\\') {
+        $file    = ($Source -split '\\')[-1]
+        $process = Get-Process -Name ($file -replace '\.exe$', '') -ErrorAction SilentlyContinue |
+            Where-Object { $_.Description } | Select-Object -First 1
+        if ($process) { return "$($process.Description) ($file)" }
+        return $file
+    }
+
+    # Drivers: "Realtek High Definition Audio (HDAUDIO\FUNC_01&...)" -> drop the device ID.
+    return ($Source -replace '\s+\([^()]*\\[^()]*\)$', '')
+}
+
+function ConvertFrom-PowerRequest {
+    # Parses "powercfg /requests": a "CATEGORY:" header line, then one
+    # "[TYPE] source" line per request, optionally followed by a reason line.
+    param([string[]]$Lines)
+
+    $requests = New-Object System.Collections.Generic.List[object]
+    $category = $null
+    $current  = $null
+
+    foreach ($line in $Lines) {
+        $text = "$line".Trim()
+
+        if ($text -cmatch '^([A-Z]+):$') {
+            $category = $Matches[1]
+            $current  = $null
+        }
+        elseif ($text -match '^\[([^\]]+)\]\s*(.+)$') {
+            $type    = $Matches[1]
+            $source  = $Matches[2]
+            $current = $null
+
+            if ($category -and $RequestEffects.ContainsKey($category)) {
+                $current = [pscustomobject]@{
+                    Category = $category
+                    Type     = $type
+                    Source   = $source
+                    Name     = Get-RequestSourceName -Type $type -Source $source
+                    Effect   = $RequestEffects[$category]
+                    Reason   = $null
+                }
+                $requests.Add($current)
+            }
+        }
+        elseif ($text -and $current -and -not $current.Reason) {
+            $current.Reason = $text
+        }
+    }
+
+    return $requests
+}
+
 function Get-SystemState {
     # Every probe is best effort: anything that fails shows up as Unknown or empty.
     $cs = $null
@@ -246,22 +563,30 @@ function Get-SystemState {
 
     $availableStates = @(Get-AvailableSleepState)
 
+    # "powercfg /requests" needs admin rights; without them the output is the
+    # error message, which still goes into the diagnostics.
+    $requestOutput = @(powercfg /requests 2>&1 | ForEach-Object { "$_" })
+    $requests      = @()
+    if (Test-IsAdmin) { $requests = @(ConvertFrom-PowerRequest -Lines $requestOutput) }
+
     [pscustomobject]@{
-        ComputerName     = $env:COMPUTERNAME
-        OperatingSystem  = if ($os) { "$($os.Caption) (build $($os.BuildNumber))" } else { 'Unknown' }
-        IsAdmin          = Test-IsAdmin
-        Domain           = if ($cs) { $cs.Domain } else { 'Unknown' }
-        DomainJoined     = [bool]($cs -and $cs.PartOfDomain)
-        EntraJoined      = [bool]($dsreg -match '^\s*AzureAdJoined\s*:\s*YES')
-        JoinStatus       = @($dsreg -match '^\s*(AzureAdJoined|EnterpriseJoined|DomainJoined|WorkplaceJoined)\s*:' |
-                             ForEach-Object { $_.Trim() })
-        MdmEnrollments   = @(Get-MdmEnrollment)
-        AvailableStates  = $availableStates
-        ModernStandby    = [bool]($availableStates -match '\bS0\b')
-        PolicySettings   = @(Get-PolicyPowerSetting)
-        PolicyActivePlan = Get-PolicyActivePlan
-        MdmPowerPolicies = @(Get-MdmPowerPolicy)
-        ManagementAgents = @(Get-ManagementAgent)
+        ComputerName       = $env:COMPUTERNAME
+        OperatingSystem    = if ($os) { "$($os.Caption) (build $($os.BuildNumber))" } else { 'Unknown' }
+        IsAdmin            = Test-IsAdmin
+        Domain             = if ($cs) { $cs.Domain } else { 'Unknown' }
+        DomainJoined       = [bool]($cs -and $cs.PartOfDomain)
+        EntraJoined        = [bool]($dsreg -match '^\s*AzureAdJoined\s*:\s*YES')
+        JoinStatus         = @($dsreg -match '^\s*(AzureAdJoined|EnterpriseJoined|DomainJoined|WorkplaceJoined)\s*:' |
+                               ForEach-Object { $_.Trim() })
+        MdmEnrollments     = @(Get-MdmEnrollment)
+        AvailableStates    = $availableStates
+        ModernStandby      = [bool]($availableStates -match '\bS0\b')
+        PolicySettings     = @(Get-PolicyPowerSetting)
+        PolicyActivePlan   = Get-PolicyActivePlan
+        MdmPowerPolicies   = @(Get-MdmPowerPolicy)
+        ManagementAgents   = @(Get-ManagementAgent)
+        PowerRequestOutput = $requestOutput
+        PowerRequests      = $requests
     }
 }
 
@@ -336,7 +661,7 @@ function Get-DiagnosticSection {
     New-Section 'POWER POLICY (GROUP POLICY / ADMX)' {
         if ($State.PolicyActivePlan) { "Enforced power plan: $($State.PolicyActivePlan)"; '' }
         if ($State.PolicySettings.Count) {
-            $State.PolicySettings | ConvertTo-TableText
+            $State.PolicySettings | Select-Object Setting, PluggedIn, OnBattery | ConvertTo-TableText
         }
         elseif (-not $State.PolicyActivePlan) {
             'No power settings are enforced by Group Policy.'
@@ -356,7 +681,7 @@ function Get-DiagnosticSection {
     New-Section 'SLEEP STATES'        { powercfg /a }
     New-Section 'SLEEP SETTINGS'      { powercfg /query SCHEME_CURRENT SUB_SLEEP }
     New-Section 'DISPLAY TIMEOUT'     { powercfg /query SCHEME_CURRENT SUB_VIDEO VIDEOIDLE }
-    New-Section 'POWER REQUESTS'      { powercfg /requests }
+    New-Section 'POWER REQUESTS'      { $State.PowerRequestOutput }
     New-Section 'WAKE TIMERS'         { powercfg /waketimers }
     New-Section 'LAST WAKE'           { powercfg /lastwake }
     New-Section 'WAKE-ARMED DEVICES'  { powercfg /devicequery wake_armed }
@@ -404,12 +729,18 @@ function Get-Analysis {
         $agentSummary = (@($State.ManagementAgents | ForEach-Object { $_.Agent }) -join ', ')
     }
 
+    $requestSummary = 'Unknown (needs Administrator)'
+    if ($State.IsAdmin) {
+        $requestSummary = if ($State.PowerRequests.Count) { "$($State.PowerRequests.Count) active" } else { 'None' }
+    }
+
     New-Finding Plain "Domain joined      : $($yesNo[$State.DomainJoined])"
     New-Finding Plain "Entra ID joined    : $($yesNo[$State.EntraJoined])"
     New-Finding Plain "MDM enrolled       : $mdmSummary"
     New-Finding Plain "Modern Standby     : $($yesNo[$State.ModernStandby])"
     New-Finding Plain "Policy settings    : $($State.PolicySettings.Count) Group Policy / ADMX, $($State.MdmPowerPolicies.Count) MDM CSP"
     New-Finding Plain "Management agents  : $agentSummary"
+    New-Finding Plain "Power requests     : $requestSummary"
     New-Finding Plain ''
 
     $controlled = $false
@@ -450,11 +781,26 @@ function Get-Analysis {
     }
 
     if ($controlled) {
-        New-Finding Info 'Settings not listed above come from the local power plan.'
+        New-Finding Info 'Settings not listed above come from the local power plan.',
+                         'Keep Awake (option 2) still works, unless policy blocks apps from preventing sleep.'
     }
     else {
         New-Finding Good 'No power policy or management agent found: the local power plan controls sleep,',
-                         'so changes made with options 2, 3, 5 and 6 should stick.'
+                         'so changes made with WhySoSleepy should stick.'
+    }
+
+    if ($State.PowerRequests.Count) {
+        New-Finding Plain ''
+        New-Finding Info 'Keeping the PC awake right now (see POWER REQUESTS):'
+        foreach ($request in $State.PowerRequests) {
+            $text = "$($request.Name) $($request.Effect)"
+            if ($request.Reason) { $text += " ($($request.Reason))" }
+            New-Finding Detail $text
+        }
+    }
+    elseif ($State.IsAdmin) {
+        New-Finding Plain ''
+        New-Finding Info 'Nothing is keeping the PC awake right now.'
     }
 
     if ($State.ModernStandby) {
@@ -503,47 +849,136 @@ function Invoke-SleepDiagnostic {
     Show-Analysis -State $state
 }
 
-function Get-ReportLine {
-    param($State)
+#endregion
 
-    "$AppTitle report"
-    "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    ''
+#region Keep awake
 
-    foreach ($section in Get-DiagnosticSection -State $State) {
-        $Rule
-        $section.Title
-        $Rule
-        $section.Lines
-        ''
-    }
-
-    $Rule
-    'FINAL ANALYSIS'
-    $Rule
-    Get-Analysis -State $State | ForEach-Object { $_.Text }
-}
-
-function Export-Report {
-    Show-Screen 'EXPORT REPORT'
-    Write-Host 'Collecting diagnostics, please wait...'
-
-    $path  = Join-Path (Get-DesktopPath) 'WhySoSleepyReport.txt'
-    $lines = @(Get-ReportLine -State (Get-SystemState))
+function Initialize-KeepAwake {
+    # Loads SetThreadExecutionState, the API media players use to keep the PC awake.
+    if ('WhySoSleepy.NativeMethods' -as [type]) { return $true }
 
     try {
-        Set-Content -LiteralPath $path -Value $lines -Encoding UTF8 -ErrorAction Stop
-        Write-Host ''
-        Write-Host "Saved to $path" -ForegroundColor Green
+        Add-Type -Namespace WhySoSleepy -Name NativeMethods -ErrorAction Stop -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+private static extern uint SetThreadExecutionState(uint esFlags);
+
+// ES_CONTINUOUS | ES_SYSTEM_REQUIRED, plus ES_DISPLAY_REQUIRED when asked.
+public static bool StayAwake(bool keepDisplayOn)
+{
+    uint flags = 0x80000001;
+    if (keepDisplayOn) { flags |= 0x00000002; }
+    return SetThreadExecutionState(flags) != 0;
+}
+
+// ES_CONTINUOUS on its own clears the request.
+public static void AllowSleep()
+{
+    SetThreadExecutionState(0x80000000);
+}
+'@
+        return $true
     }
     catch {
-        Write-Host "Could not save the report: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Could not load the Windows API that Keep Awake needs: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
     }
+}
+
+function Start-KeepAwake {
+    Show-Screen 'KEEP AWAKE'
+
+    Write-Host 'Keeps the PC awake for a while without changing any settings. It needs no'
+    Write-Host 'admin rights and is not undone by policy timeouts. It stops when the time'
+    Write-Host 'runs out, when you press Q, or when you close this window.'
+    Write-Host ''
+
+    if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+        Write-Host 'Keep Awake is not available: PowerShell runs in Constrained Language Mode on' -ForegroundColor Red
+        Write-Host 'this PC, which blocks the Windows API it needs.' -ForegroundColor Red
+        return
+    }
+    if (-not (Initialize-KeepAwake)) { return }
+
+    $blocked = @(Get-PolicyPowerSetting | Where-Object {
+        $_.Guid -eq $AllowSystemRequiredGuid -and ($_.PluggedIn -eq 0 -or $_.OnBattery -eq 0)
+    })
+    if ($blocked.Count) {
+        Write-Host 'Policy on this PC stops apps from preventing automatic sleep, so Keep Awake' -ForegroundColor Yellow
+        Write-Host 'may not work (see Run Diagnostics for details).' -ForegroundColor Yellow
+        Write-Host ''
+    }
+
+    $minutes = Read-Number -Prompt 'Minutes to stay awake (1-1440, 0 = until you press Q)' -Minimum 0 -Maximum 1440
+    if ($null -eq $minutes) { return }
+
+    if (@(Get-AvailableSleepState) -match '\bS0\b') {
+        Write-Host 'Tip: on Modern Standby PCs, keeping the display on is the most reliable option.'
+    }
+    $keepDisplayOn = Confirm-Action 'Keep the display on as well?'
+
+    if (-not [WhySoSleepy.NativeMethods]::StayAwake($keepDisplayOn)) {
+        Write-Host 'Windows rejected the keep-awake request.' -ForegroundColor Red
+        return
+    }
+
+    $start = Get-Date
+    $end   = $start.AddMinutes($minutes)
+    $what  = if ($keepDisplayOn) { 'the PC and display' } else { 'the PC' }
+
+    Write-Host ''
+    if ($minutes -gt 0) {
+        Write-Host "Keeping $what awake until $($end.ToString('t'))." -ForegroundColor Green
+    }
+    else {
+        Write-Host "Keeping $what awake until you press Q." -ForegroundColor Green
+    }
+    Write-Host 'Press Q to stop.'
+    Write-Host ''
+
+    # Without a real console (for example in the ISE) keys cannot be read, so
+    # only the timer or closing the window stops it.
+    $canReadKeys = $true
+    try {
+        while ([Console]::KeyAvailable) { $null = [Console]::ReadKey($true) }
+    }
+    catch {
+        $canReadKeys = $false
+    }
+
+    try {
+        while ($true) {
+            $now = Get-Date
+            if ($minutes -gt 0) {
+                $left = $end - $now
+                if ($left.TotalSeconds -le 0) { break }
+                $status = 'Time left: ' + (Format-Duration $left)
+            }
+            else {
+                $status = 'Awake for: ' + (Format-Duration ($now - $start))
+            }
+            Write-Host "`r$status " -NoNewline
+
+            if ($canReadKeys -and [Console]::KeyAvailable) {
+                $key = [Console]::ReadKey($true)
+                if ($key.Key -eq 'Q' -or $key.Key -eq 'Escape') { break }
+            }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    finally {
+        # Also runs on Ctrl+C. Windows drops the request when the process
+        # exits anyway, so closing the window is safe too.
+        [WhySoSleepy.NativeMethods]::AllowSleep()
+        Write-Host ''
+    }
+
+    Write-Host ''
+    Write-Host 'Keep Awake stopped. Normal sleep settings apply again.' -ForegroundColor Green
 }
 
 #endregion
 
-#region Power changes
+#region Sleep settings
 
 function Write-PolicyWarning {
     # powercfg changes are silently reverted when a policy enforces the setting.
@@ -561,6 +996,8 @@ function Set-PowerTimeout {
         [int]$Minutes,
         [switch]$IncludeHibernate
     )
+
+    Update-UndoState -Timeouts
 
     $settings = @('standby-timeout-ac', 'standby-timeout-dc', 'monitor-timeout-ac', 'monitor-timeout-dc')
     if ($IncludeHibernate) { $settings += 'hibernate-timeout-ac', 'hibernate-timeout-dc' }
@@ -594,13 +1031,8 @@ function Set-SleepTimeout {
     Write-Host '1440 = 24 Hours'
     Write-Host ''
 
-    $answer  = Read-Host 'Enter timeout in minutes (0-1440)'
-    $minutes = 0
-
-    if (-not [int]::TryParse("$answer".Trim(), [ref]$minutes) -or $minutes -lt 0 -or $minutes -gt 1440) {
-        Write-Host 'Please enter a whole number from 0 to 1440.' -ForegroundColor Red
-        return
-    }
+    $minutes = Read-Number -Prompt 'Enter timeout in minutes (0-1440)' -Minimum 0 -Maximum 1440
+    if ($null -eq $minutes) { return }
 
     if (Set-PowerTimeout -Minutes $minutes) {
         $label = if ($minutes -eq 0) { 'Never' } else { "$minutes minute(s)" }
@@ -621,54 +1053,14 @@ function Disable-Sleep {
     Write-PolicyWarning
 }
 
-function Show-PowerPlanList {
-    Show-Screen 'POWER PLANS'
-    powercfg /list | Out-Host
-    Write-Host '* = active plan'
-}
-
-function Get-UltimatePlanGuid {
-    # Reuse an existing Ultimate Performance plan (ours, the built-in one, or a
-    # copy made by hand or by an older version): /duplicatescheme creates a
-    # brand new copy every time it runs.
-    foreach ($line in @(powercfg /list)) {
-        if ($line -match "$UltimatePlanGuid|$UltimateSchemeGuid|Ultimate" -and $line -match $GuidPattern) {
-            return $Matches[0]
-        }
-    }
-
-    $output = powercfg /duplicatescheme $UltimateSchemeGuid $UltimatePlanGuid 2>&1
-    if ($LASTEXITCODE -ne 0) { return $null }
-    if ("$output" -match $GuidPattern) { return $Matches[0] }
-    return $UltimatePlanGuid
-}
-
-function Enable-UltimatePerformance {
-    # Returns $true when the Ultimate Performance plan ends up active.
-    $guid = Get-UltimatePlanGuid
-    if (-not $guid) {
-        Write-Host 'The Ultimate Performance plan could not be created.' -ForegroundColor Red
-        Write-Host 'It is usually unavailable on Modern Standby (S0) devices.' -ForegroundColor Red
-        return $false
-    }
-
-    powercfg /setactive $guid | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "Could not activate the Ultimate Performance plan ($guid)." -ForegroundColor Red
-        return $false
-    }
-
-    Write-Host "Ultimate Performance plan activated ($guid)." -ForegroundColor Green
-    return $true
-}
-
-function Enable-UltimateNoSleep {
-    Show-Screen 'ULTIMATE PERFORMANCE + DISABLE SLEEP'
+function Disable-SleepAndHibernation {
+    Show-Screen 'DISABLE SLEEP + HIBERNATION'
 
     Write-Host 'This will:'
-    Write-Host '  - Activate the Ultimate Performance power plan'
     Write-Host '  - Turn hibernation off (this also disables Fast Startup)'
     Write-Host '  - Set the sleep and display timeouts to Never'
+    Write-Host ''
+    Write-Host 'Undo Changes (option 8) can turn hibernation back on later.'
     Write-Host ''
 
     if (-not (Test-Elevation 'Turning hibernation off')) { return }
@@ -678,10 +1070,7 @@ function Enable-UltimateNoSleep {
     }
     Write-Host ''
 
-    # Timeouts apply to the active plan, so switch plans first. If the switch
-    # fails, sleep is still disabled on the current plan.
-    $null = Enable-UltimatePerformance
-
+    Update-UndoState -Hibernation
     powercfg /hibernate off | Out-Host
     if ($LASTEXITCODE -eq 0) {
         Write-Host 'Hibernation turned off.' -ForegroundColor Green
@@ -695,6 +1084,378 @@ function Enable-UltimateNoSleep {
     }
 
     Write-PolicyWarning
+}
+
+#endregion
+
+#region Power plans
+
+function Write-PlanList {
+    param([object[]]$Plans)
+
+    if (-not $Plans.Count) {
+        Write-Host 'No power plans found.' -ForegroundColor Red
+        return
+    }
+
+    for ($i = 0; $i -lt $Plans.Count; $i++) {
+        $line = '{0,3}. {1}' -f ($i + 1), $Plans[$i].Name
+        if ($Plans[$i].Active) {
+            Write-Host "$line  (active)" -ForegroundColor Green
+        }
+        else {
+            Write-Host $line
+        }
+    }
+}
+
+function Find-UltimatePlan {
+    # Existing Ultimate Performance plans: WhySoSleepy's copy, the built-in one,
+    # or copies made by hand or by older versions.
+    Get-PowerPlan | Where-Object {
+        $_.Guid -eq $UltimatePlanGuid -or $_.Guid -eq $UltimateSchemeGuid -or $_.Name -match 'Ultimate'
+    }
+}
+
+function Set-ActivePlan {
+    # Activates a plan, saving the previous one for Undo. Returns $true on success.
+    param([string]$Guid)
+
+    Update-UndoState -ActiveScheme
+    powercfg /setactive $Guid | Out-Host
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Switch-PowerPlan {
+    param([object[]]$Plans)
+
+    if (-not $Plans.Count) { return }
+
+    $number = Read-Number -Prompt "Plan number to activate (1-$($Plans.Count))" -Minimum 1 -Maximum $Plans.Count
+    if ($null -eq $number) { return }
+
+    $plan = $Plans[$number - 1]
+    if ($plan.Active) {
+        Write-Host "$($plan.Name) is already active."
+        return
+    }
+
+    if (Set-ActivePlan -Guid $plan.Guid) {
+        Write-Host "$($plan.Name) is now active." -ForegroundColor Green
+        Write-PolicyWarning
+    }
+    else {
+        Write-Host "Could not activate $($plan.Name)." -ForegroundColor Red
+    }
+}
+
+function Enable-UltimatePerformance {
+    $plan = Find-UltimatePlan | Select-Object -First 1
+
+    if ($plan) {
+        $guid = $plan.Guid
+        if ($plan.Active) {
+            Write-Host 'Ultimate Performance is already the active plan.'
+            return
+        }
+    }
+    else {
+        $output = powercfg /duplicatescheme $UltimateSchemeGuid $UltimatePlanGuid 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'The Ultimate Performance plan could not be created.' -ForegroundColor Red
+            Write-Host 'It is usually unavailable on Modern Standby (S0) devices.' -ForegroundColor Red
+            return
+        }
+
+        $guid = $UltimatePlanGuid
+        if ("$output" -match $GuidPattern) { $guid = $Matches[0] }
+        Update-UndoState -CreatedPlan $guid
+        Write-Host 'Created the Ultimate Performance plan.'
+    }
+
+    if (Set-ActivePlan -Guid $guid) {
+        Write-Host 'Ultimate Performance plan activated.' -ForegroundColor Green
+        Write-Host 'Note: it keeps the CPU at full speed, which uses more power and battery.'
+        Write-PolicyWarning
+    }
+    else {
+        Write-Host "Could not activate the Ultimate Performance plan ($guid)." -ForegroundColor Red
+    }
+}
+
+function Show-PowerPlanMenu {
+    while ($true) {
+        Show-Screen 'POWER PLANS'
+        $plans = @(Get-PowerPlan)
+        Write-PlanList -Plans $plans
+        Write-Host ''
+        Write-Host '1. Switch plan'
+        Write-Host '2. Enable Ultimate Performance'
+        Write-Host '0. Back'
+        Write-Host ''
+
+        switch (Read-MenuChoice) {
+            '1' { Switch-PowerPlan -Plans $plans; Wait-ForEnter }
+            '2' { Write-Host ''; Enable-UltimatePerformance; Wait-ForEnter }
+            '0' { return }
+            default { Write-InvalidOption }
+        }
+    }
+}
+
+#endregion
+
+#region Undo
+
+function Write-UndoSummary {
+    param(
+        [hashtable]$Undo,
+        [object[]]$Plans
+    )
+
+    if (-not $Undo.Saved) {
+        Write-Host 'No saved settings yet. WhySoSleepy saves your settings automatically'
+        Write-Host 'before it first changes them.'
+        return
+    }
+
+    Write-Host "Settings saved on $($Undo.Saved), before WhySoSleepy changed them:"
+    if ($Undo.ActiveScheme) {
+        Write-Host "  Power plan  : $(Get-PlanName -Guid $Undo.ActiveScheme -Plans $Plans)"
+    }
+    if ($null -ne $Undo.HibernateEnabled) {
+        Write-Host "  Hibernation : $(if ($Undo.HibernateEnabled) { 'On' } else { 'Off' })"
+    }
+    if ($Undo.Timeouts.Count) {
+        $schemes = @($Undo.Timeouts | ForEach-Object { $_.Scheme } | Select-Object -Unique |
+            ForEach-Object { Get-PlanName -Guid $_ -Plans $Plans })
+        Write-Host "  Timeouts    : $($schemes -join ', ')"
+    }
+    if ($Undo.CreatedPlan) {
+        Write-Host "  Added plan  : $(Get-PlanName -Guid $Undo.CreatedPlan -Plans $Plans) (will be removed)"
+    }
+}
+
+function Restore-SavedSetting {
+    $undo = Get-UndoState
+    if (-not $undo.Saved) {
+        Write-Host 'There are no saved settings to restore.'
+        return
+    }
+
+    $planGuids = @(Get-PowerPlan | ForEach-Object { $_.Guid })
+    $ok = $true
+
+    if ($undo.HibernateEnabled -and -not (Test-HibernateEnabled)) {
+        if (Test-IsAdmin) {
+            powercfg /hibernate on | Out-Host
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host 'Hibernation turned back on.' -ForegroundColor Green
+                $undo.HibernateEnabled = $null
+            }
+            else {
+                Write-Host 'Could not turn hibernation back on.' -ForegroundColor Red
+                $ok = $false
+            }
+        }
+        else {
+            Write-Host 'Turning hibernation back on requires Administrator rights; skipped.' -ForegroundColor Yellow
+            $ok = $false
+        }
+    }
+    else {
+        $undo.HibernateEnabled = $null
+    }
+
+    $remaining = @()
+    $restored  = 0
+    foreach ($timeout in $undo.Timeouts) {
+        # Plans deleted since then have nothing left to restore.
+        if ($planGuids -notcontains $timeout.Scheme) { continue }
+
+        powercfg /setacvalueindex $timeout.Scheme $timeout.Subgroup $timeout.Setting $timeout.AC | Out-Host
+        $acOk = ($LASTEXITCODE -eq 0)
+        powercfg /setdcvalueindex $timeout.Scheme $timeout.Subgroup $timeout.Setting $timeout.DC | Out-Host
+        if ($acOk -and $LASTEXITCODE -eq 0) {
+            $restored++
+        }
+        else {
+            $remaining += $timeout
+            $ok = $false
+        }
+    }
+    if ($restored -and -not $remaining.Count) {
+        Write-Host 'Sleep, hibernate and display timeouts restored.' -ForegroundColor Green
+    }
+    $undo.Timeouts = $remaining
+
+    # Re-activating the plan also applies the restored values.
+    $target = Get-ActiveSchemeGuid
+    if ($undo.ActiveScheme -and $planGuids -contains $undo.ActiveScheme) { $target = $undo.ActiveScheme }
+    if ($target) {
+        powercfg /setactive $target | Out-Host
+        if ($LASTEXITCODE -eq 0) {
+            if ($undo.ActiveScheme) {
+                Write-Host "Switched back to $(Get-PlanName -Guid $target -Plans @(Get-PowerPlan))." -ForegroundColor Green
+            }
+            $undo.ActiveScheme = $null
+        }
+        else {
+            Write-Host 'Could not re-activate the power plan.' -ForegroundColor Red
+            $ok = $false
+        }
+    }
+
+    if ($undo.CreatedPlan -and $planGuids -contains $undo.CreatedPlan -and $undo.CreatedPlan -ne $target) {
+        powercfg /delete $undo.CreatedPlan | Out-Host
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host 'Removed the Ultimate Performance plan WhySoSleepy added.' -ForegroundColor Green
+            $undo.CreatedPlan = $null
+        }
+        else {
+            Write-Host 'Could not remove the Ultimate Performance plan.' -ForegroundColor Red
+            $ok = $false
+        }
+    }
+    elseif ($planGuids -notcontains $undo.CreatedPlan) {
+        $undo.CreatedPlan = $null
+    }
+
+    # Whatever was restored is dropped from the undo file; anything that
+    # failed stays so it can be retried.
+    $null = Save-UndoState -Undo $undo
+
+    Write-Host ''
+    if ($ok) {
+        Write-Host 'All saved settings restored.' -ForegroundColor Green
+    }
+    else {
+        Write-Host 'Some settings could not be restored. They are still saved, so you can try again.' -ForegroundColor Yellow
+    }
+}
+
+function Switch-ToBalanced {
+    powercfg /setactive $BalancedSchemeGuid | Out-Host
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host 'Balanced plan activated.' -ForegroundColor Green
+    }
+    else {
+        Write-Host 'Could not activate the Balanced plan.' -ForegroundColor Red
+    }
+}
+
+function Enable-Hibernation {
+    if (-not (Test-Elevation 'Turning hibernation on')) { return }
+
+    powercfg /hibernate on | Out-Host
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host 'Hibernation turned back on (Fast Startup is available again).' -ForegroundColor Green
+    }
+    else {
+        Write-Host 'Could not turn hibernation on.' -ForegroundColor Red
+    }
+}
+
+function Remove-UltimatePlan {
+    # Removes copies of Ultimate Performance; the built-in scheme is left alone.
+    $copies = @(Find-UltimatePlan | Where-Object { $_.Guid -ne $UltimateSchemeGuid })
+    if (-not $copies.Count) {
+        Write-Host 'There is no Ultimate Performance plan to remove.'
+        return
+    }
+
+    Write-Host 'This removes:'
+    foreach ($plan in $copies) { Write-Host "  - $($plan.Name) ($($plan.Guid))" }
+    Write-Host ''
+    if (-not (Confirm-Action 'Continue?')) {
+        Write-Host 'Cancelled.'
+        return
+    }
+
+    # The active plan cannot be deleted, so switch away from it first: back to
+    # the plan saved for Undo, or to Balanced.
+    $copyGuids = @($copies | ForEach-Object { $_.Guid })
+    if ($copies | Where-Object { $_.Active }) {
+        $undo     = Get-UndoState
+        $fallback = $BalancedSchemeGuid
+        $plans    = @(Get-PowerPlan | ForEach-Object { $_.Guid })
+        if ($undo.ActiveScheme -and $copyGuids -notcontains $undo.ActiveScheme -and $plans -contains $undo.ActiveScheme) {
+            $fallback = $undo.ActiveScheme
+        }
+
+        powercfg /setactive $fallback | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'Could not switch away from Ultimate Performance; nothing was removed.' -ForegroundColor Red
+            return
+        }
+        Write-Host "Switched to $(Get-PlanName -Guid $fallback -Plans @(Get-PowerPlan))."
+    }
+
+    foreach ($plan in $copies) {
+        powercfg /delete $plan.Guid | Out-Host
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Removed $($plan.Name)." -ForegroundColor Green
+        }
+        else {
+            Write-Host "Could not remove $($plan.Name)." -ForegroundColor Red
+        }
+    }
+
+    # Forget the removed plan so Undo does not try to remove it again.
+    $undo = Get-UndoState
+    if ($undo.CreatedPlan -and $copyGuids -contains $undo.CreatedPlan) {
+        $undo.CreatedPlan = $null
+        $null = Save-UndoState -Undo $undo
+    }
+}
+
+function Restore-DefaultPowerPlan {
+    Write-Host 'This resets every power plan to the Windows defaults and DELETES all'
+    Write-Host 'custom power plans, including ones made by your PC maker or IT.'
+    Write-Host ''
+    if (-not (Confirm-Action 'Restore the default power plans?')) {
+        Write-Host 'Cancelled.'
+        return
+    }
+
+    powercfg /restoredefaultschemes | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host 'Could not restore the default power plans.' -ForegroundColor Red
+        return
+    }
+    Write-Host 'Default power plans restored.' -ForegroundColor Green
+
+    # Saved plan and timeout values no longer apply; hibernation is separate.
+    $undo = Get-UndoState
+    $undo.ActiveScheme = $null
+    $undo.CreatedPlan  = $null
+    $undo.Timeouts     = @()
+    $null = Save-UndoState -Undo $undo
+}
+
+function Show-UndoMenu {
+    while ($true) {
+        Show-Screen 'UNDO CHANGES'
+        Write-UndoSummary -Undo (Get-UndoState) -Plans @(Get-PowerPlan)
+        Write-Host ''
+        Write-Host '1. Restore saved settings'
+        Write-Host '2. Switch to the Balanced plan'
+        Write-Host '3. Turn hibernation back on'
+        Write-Host '4. Remove the Ultimate Performance plan'
+        Write-Host '5. Restore Windows default power plans'
+        Write-Host '0. Back'
+        Write-Host ''
+
+        switch (Read-MenuChoice) {
+            '1' { Write-Host ''; Restore-SavedSetting; Wait-ForEnter }
+            '2' { Write-Host ''; Switch-ToBalanced; Wait-ForEnter }
+            '3' { Write-Host ''; Enable-Hibernation; Wait-ForEnter }
+            '4' { Write-Host ''; Remove-UltimatePlan; Wait-ForEnter }
+            '5' { Write-Host ''; Restore-DefaultPowerPlan; Wait-ForEnter }
+            '0' { return }
+            default { Write-InvalidOption }
+        }
+    }
 }
 
 #endregion
@@ -735,6 +1496,73 @@ function New-PowercfgReport {
     }
 }
 
+function Get-ReportLine {
+    param($State)
+
+    "$AppTitle report"
+    "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    ''
+
+    foreach ($section in Get-DiagnosticSection -State $State) {
+        $Rule
+        $section.Title
+        $Rule
+        $section.Lines
+        ''
+    }
+
+    $Rule
+    'FINAL ANALYSIS'
+    $Rule
+    Get-Analysis -State $State | ForEach-Object { $_.Text }
+}
+
+function Export-Report {
+    Show-Screen 'TEXT REPORT'
+    Write-Host 'Collecting diagnostics, please wait...'
+
+    $path  = Join-Path (Get-DesktopPath) 'WhySoSleepyReport.txt'
+    $lines = @(Get-ReportLine -State (Get-SystemState))
+
+    try {
+        Set-Content -LiteralPath $path -Value $lines -Encoding UTF8 -ErrorAction Stop
+        Write-Host ''
+        Write-Host "Saved to $path" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Could not save the report: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+function Show-ReportMenu {
+    while ($true) {
+        Show-Screen 'REPORTS'
+        Write-Host 'Reports are saved to your Desktop.'
+        Write-Host ''
+        Write-Host '1. Sleep Study report (HTML)'
+        Write-Host '2. Energy report (HTML, takes 30 seconds)'
+        Write-Host '3. Text report with all diagnostics'
+        Write-Host '0. Back'
+        Write-Host ''
+
+        switch (Read-MenuChoice) {
+            '1' {
+                New-PowercfgReport -Title 'SLEEP STUDY REPORT' -FileName 'SleepStudy.html' -Arguments '/sleepstudy'
+                Wait-ForEnter
+            }
+            '2' {
+                New-PowercfgReport -Title 'ENERGY REPORT' -FileName 'EnergyReport.html' `
+                    -Arguments '/energy', '/duration', '30' `
+                    -Note 'Tracing system activity for 30 seconds. Leave the PC idle until it finishes.'
+                Wait-ForEnter
+            }
+            '3' { Export-Report; Wait-ForEnter }
+            '0' { return }
+            default { Write-InvalidOption }
+        }
+    }
+}
+
 #endregion
 
 #region Main
@@ -763,51 +1591,32 @@ while ($true) {
         Write-Host 'Running as Administrator' -ForegroundColor Green
     }
     else {
-        Write-Host 'Not running as Administrator - options 6-8 are unavailable' -ForegroundColor Yellow
+        Write-Host 'Not running as Administrator - some options are limited' -ForegroundColor Yellow
     }
     Write-Host ''
 
     Write-Host '1. Run Diagnostics'
-    Write-Host '2. Set Sleep Timeout'
-    Write-Host '3. Disable Sleep'
-    Write-Host '4. Show Power Plans'
-    Write-Host '5. Enable Ultimate Performance'
-    Write-Host '6. Ultimate + Disable Sleep'
-    Write-Host '7. Generate Sleep Study Report'
-    Write-Host '8. Generate Energy Report'
-    Write-Host '9. Export Report'
+    Write-Host '2. Keep Awake (temporary)'
+    Write-Host '3. Set Sleep Timeout'
+    Write-Host '4. Disable Sleep'
+    Write-Host '5. Disable Sleep + Hibernation'
+    Write-Host '6. Power Plans >'
+    Write-Host '7. Reports >'
+    Write-Host '8. Undo Changes >'
     Write-Host '0. Exit'
     Write-Host ''
 
-    $choice = Read-Host 'Select option'
-
-    switch ("$choice".Trim()) {
+    switch (Read-MenuChoice) {
         '1' { Invoke-SleepDiagnostic; Wait-ForEnter }
-        '2' { Set-SleepTimeout; Wait-ForEnter }
-        '3' { Disable-Sleep; Wait-ForEnter }
-        '4' { Show-PowerPlanList; Wait-ForEnter }
-        '5' {
-            Show-Screen 'ENABLE ULTIMATE PERFORMANCE'
-            if (Enable-UltimatePerformance) { Write-PolicyWarning }
-            Wait-ForEnter
-        }
-        '6' { Enable-UltimateNoSleep; Wait-ForEnter }
-        '7' {
-            New-PowercfgReport -Title 'SLEEP STUDY REPORT' -FileName 'SleepStudy.html' -Arguments '/sleepstudy'
-            Wait-ForEnter
-        }
-        '8' {
-            New-PowercfgReport -Title 'ENERGY REPORT' -FileName 'EnergyReport.html' `
-                -Arguments '/energy', '/duration', '30' `
-                -Note 'Tracing system activity for 30 seconds. Leave the PC idle until it finishes.'
-            Wait-ForEnter
-        }
-        '9' { Export-Report; Wait-ForEnter }
+        '2' { Start-KeepAwake; Wait-ForEnter }
+        '3' { Set-SleepTimeout; Wait-ForEnter }
+        '4' { Disable-Sleep; Wait-ForEnter }
+        '5' { Disable-SleepAndHibernation; Wait-ForEnter }
+        '6' { Show-PowerPlanMenu }
+        '7' { Show-ReportMenu }
+        '8' { Show-UndoMenu }
         '0' { exit 0 }
-        default {
-            Write-Host 'Invalid option.' -ForegroundColor Red
-            Start-Sleep -Seconds 1
-        }
+        default { Write-InvalidOption }
     }
 }
 
